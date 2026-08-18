@@ -111,6 +111,13 @@ impl IntoResponse for MessagesRouteError {
                 StatusCode::BAD_GATEWAY,
                 "messages provider request failed".to_string(),
             ),
+            // The gateway has no Python implementation to decline to, so a
+            // request the core cannot serve is reported to the caller. The
+            // reason is a fixed internal string, never provider content.
+            CoreError::Unsupported(reason) => (
+                StatusCode::BAD_REQUEST,
+                format!("messages request is not supported: {reason}"),
+            ),
         };
         (
             status,
