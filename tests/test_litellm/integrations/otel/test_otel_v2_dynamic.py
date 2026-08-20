@@ -185,3 +185,88 @@ def test_dynamic_headers_do_not_leak_to_other_owners_exporter():
     assert by_owner["arize"] == "arize-space-id=TEAMX,api_key=TEAMX_KEY"
     assert by_owner[None] == "x=base-collector"
     assert by_owner["langfuse_otel"] == "Authorization=Basic base-langfuse"
+
+
+# --- New Relic: per-team api-key header + fixed-table region endpoint --- #
+
+
+def test_newrelic_dynamic_headers():
+    assert dynamic_otlp_headers("newrelic", {"newrelic_api_key": "NRAL-KEY"}) == {"api-key": "NRAL-KEY"}
+    assert dynamic_otlp_headers("newrelic", {"newrelic_region": "eu"}) is None
+
+
+def test_newrelic_dynamic_endpoint_resolves_from_fixed_table():
+    from litellm.integrations.otel.presets import dynamic_otlp_endpoint
+
+    assert dynamic_otlp_endpoint("newrelic", {"newrelic_region": "eu"}) == "https://otlp.eu01.nr-data.net"
+    assert dynamic_otlp_endpoint("newrelic", {"newrelic_region": "US"}) == "https://otlp.nr-data.net"
+    # Unknown region falls back to the preset default rather than a guessed host.
+    assert dynamic_otlp_endpoint("newrelic", {"newrelic_region": "mars"}) is None
+    assert dynamic_otlp_endpoint("newrelic", {"newrelic_api_key": "k"}) is None
+    # Callbacks without an endpoint resolver keep their preset endpoint.
+    assert dynamic_otlp_endpoint("arize", {"newrelic_region": "eu"}) is None
+
+
+def test_newrelic_endpoint_stamped_onto_owned_exporter_only():
+    cache = _cache(
+        "newrelic",
+        exporters=[
+            ExporterSpec(
+                kind="otlp_http",
+                endpoint="http://self-hosted-collector:4318",
+                headers="x=base-collector",
+                owner=None,
+            ),
+            ExporterSpec(
+                kind="otlp_http",
+                endpoint="https://otlp.nr-data.net",
+                owner="newrelic",
+                requires_headers=True,
+            ),
+        ],
+    )
+    new_cfg = cache._config_with_headers({"api-key": "TEAM-EU-KEY"}, "https://otlp.eu01.nr-data.net")
+    by_owner = {e.owner: e for e in new_cfg.exporters}
+    assert by_owner["newrelic"].endpoint == "https://otlp.eu01.nr-data.net"
+    assert by_owner["newrelic"].headers == "api-key=TEAM-EU-KEY"
+    assert by_owner[None].endpoint == "http://self-hosted-collector:4318"
+    assert by_owner[None].headers == "x=base-collector"
+
+
+def test_newrelic_provider_cached_per_key_and_region():
+    cache = _cache(
+        "newrelic",
+        exporters=[ExporterSpec(kind="in_memory"), ExporterSpec(kind="otlp_http", owner="newrelic")],
+    )
+    default = NoOpTracer()
+    cache.tracer_for(default, {"newrelic_api_key": "K1", "newrelic_region": "us"})
+    cache.tracer_for(default, {"newrelic_api_key": "K1", "newrelic_region": "us"})
+    assert len(cache._providers) == 1
+    # Same key, different region → distinct provider (distinct endpoint).
+    cache.tracer_for(default, {"newrelic_api_key": "K1", "newrelic_region": "eu"})
+    assert len(cache._providers) == 2
+    cache.tracer_for(default, {"newrelic_api_key": "K2", "newrelic_region": "eu"})
+    assert len(cache._providers) == 3
+
+
+def test_requires_headers_spec_skipped_without_headers():
+    from litellm.integrations.otel.plumbing.providers import build_tracer_provider
+
+    cfg = OpenTelemetryV2Config(
+        exporters=[ExporterSpec(kind="otlp_http", endpoint="https://otlp.nr-data.net", requires_headers=True)]
+    )
+    provider = build_tracer_provider(cfg)
+    processors = provider._active_span_processor._span_processors
+    # Only the baggage processor: the keyless spec must not export (New Relic
+    # rejects unauthenticated posts with a 4xx per span batch).
+    assert [type(p).__name__ for p in processors] == ["LiteLLMBaggageSpanProcessor"]
+
+    keyed = OpenTelemetryV2Config(
+        exporters=[
+            ExporterSpec(
+                kind="otlp_http", endpoint="https://otlp.nr-data.net", headers="api-key=k", requires_headers=True
+            )
+        ]
+    )
+    keyed_provider = build_tracer_provider(keyed)
+    assert len(keyed_provider._active_span_processor._span_processors) == 2

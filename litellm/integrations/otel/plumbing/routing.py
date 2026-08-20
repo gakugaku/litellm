@@ -21,7 +21,7 @@ from litellm.integrations.otel.plumbing.providers import (
     build_tracer_provider,
     get_tracer,
 )
-from litellm.integrations.otel.presets import dynamic_otlp_headers
+from litellm.integrations.otel.presets import dynamic_otlp_endpoint, dynamic_otlp_headers
 
 # Exporter kinds that ignore headers — never rewritten with dynamic credentials.
 _NON_OTLP_KINDS: Final = ("console", "in_memory", "inmemory", "memory")
@@ -61,7 +61,9 @@ class TenantTracerCache:
         self._config = config
         self._callback_name = callback_name
         self._tracer_name = tracer_name
-        self._providers: OrderedDict[tuple[tuple[str, str], ...], TracerProvider] = OrderedDict()
+        self._providers: OrderedDict[tuple[str | None, tuple[tuple[str, str], ...]], TracerProvider] = (
+            OrderedDict()  # mutable-ok: bounded LRU; eviction needs in-place ordered mutation
+        )
 
     def tracer_for(self, default: Tracer, dynamic_params: Any) -> Tracer:
         """Return the tracer for this request.
@@ -74,19 +76,20 @@ class TenantTracerCache:
         headers: Final = dynamic_otlp_headers(self._callback_name, dynamic_params)
         if not headers:
             return default
-        cache_key: Final = tuple(sorted(headers.items()))
+        endpoint: Final = dynamic_otlp_endpoint(self._callback_name, dynamic_params)
+        cache_key: Final = (endpoint, tuple(sorted(headers.items())))
         provider = self._providers.get(cache_key)
         if provider is not None:
             self._providers.move_to_end(cache_key)
         else:
-            provider = build_tracer_provider(self._config_with_headers(headers))
+            provider = build_tracer_provider(self._config_with_headers(headers, endpoint))
             self._providers[cache_key] = provider
             if len(self._providers) > _MAX_CACHED_PROVIDERS:
                 _, evicted = self._providers.popitem(last=False)
                 _shutdown_provider(evicted)
         return get_tracer(provider, self._tracer_name)
 
-    def _config_with_headers(self, headers: Mapping[str, str]) -> OpenTelemetryV2Config:
+    def _config_with_headers(self, headers: Mapping[str, str], endpoint: str | None = None) -> OpenTelemetryV2Config:
         """Clone the config, stamping ``headers`` onto the credential's own exporter.
 
         ``headers`` are the per-request credentials of ``self._callback_name`` (the
@@ -95,12 +98,18 @@ class TenantTracerCache:
         tenant's Arize key must never rewrite the headers of a co-configured
         Langfuse or self-hosted collector exporter, which would leak that key to a
         different backend.
+
+        ``endpoint`` (from ``dynamic_otlp_endpoint``, a fixed per-integration
+        region table — never a caller-supplied URL) likewise replaces only the
+        owned exporter's endpoint; ``None`` keeps the preset's own.
         """
         header_str: Final = ",".join(f"{key}={value}" for key, value in headers.items())
-        header_update: Final[dict[str, str]] = {"headers": header_str}
+        spec_update: Final = {  # mutable-ok: model_copy(update=...) requires a plain dict
+            field: value for field, value in (("headers", header_str), ("endpoint", endpoint)) if value
+        }
         exporters: Final = [
             (
-                spec.model_copy(update=header_update)
+                spec.model_copy(update=spec_update)
                 if spec.owner == self._callback_name and spec.kind.lower() not in _NON_OTLP_KINDS
                 else spec
             )

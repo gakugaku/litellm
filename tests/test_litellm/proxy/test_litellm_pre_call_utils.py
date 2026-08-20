@@ -6887,3 +6887,55 @@ async def test_add_litellm_data_to_request_caller_tags_empty_when_caller_sends_n
 
     assert updated["metadata"]["tags"] == ["key-supplied"]
     assert updated["metadata"]["caller_tags"] == ()
+
+
+@pytest.mark.asyncio
+async def test_newrelic_team_callback_vars_reach_trusted_field():
+    """A key with a newrelic team callback stamps its vars into the proxy-owned
+    trusted field, and a caller-supplied newrelic_api_key in the body is
+    stripped rather than merged."""
+    key_with_newrelic_callback = UserAPIKeyAuth(
+        api_key="hashed-key",
+        metadata={
+            "logging": [
+                {
+                    "callback_name": "newrelic",
+                    "callback_type": "success",
+                    "callback_vars": {"newrelic_api_key": "team-nr-key", "newrelic_region": "eu"},
+                }
+            ]
+        },
+    )
+    data = {
+        "model": "gpt-3.5-turbo",
+        "messages": [{"role": "user", "content": "hello"}],
+        "newrelic_api_key": "attacker-key",
+    }
+
+    updated = await add_litellm_data_to_request(
+        data=data,
+        request=_callback_credential_request_mock(),
+        user_api_key_dict=key_with_newrelic_callback,
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    assert updated[TRUSTED_CALLBACK_VARS_FIELD] == {
+        "newrelic_api_key": "team-nr-key",
+        "newrelic_region": "eu",
+    }
+    assert updated["success_callback"] == ["newrelic"]
+
+    from litellm.litellm_core_utils.initialize_dynamic_callback_params import (
+        initialize_standard_callback_dynamic_params,
+    )
+
+    params = initialize_standard_callback_dynamic_params(updated)
+    assert params.get("newrelic_api_key") == "team-nr-key"
+    assert params.get("newrelic_region") == "eu"
+
+    from litellm.integrations.otel.presets import dynamic_otlp_endpoint, dynamic_otlp_headers
+
+    assert dynamic_otlp_headers("newrelic", params) == {"api-key": "team-nr-key"}
+    assert dynamic_otlp_endpoint("newrelic", params) == "https://otlp.eu01.nr-data.net"

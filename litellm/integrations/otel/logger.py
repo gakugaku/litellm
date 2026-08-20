@@ -428,22 +428,30 @@ class OpenTelemetryV2(CustomLogger):
     ) -> Span | None:
         """Finish the LLM-call span opened at ``pre_call`` (or create it deferred).
 
-        No carrier for this call id means ``pre_call`` never ran — the request was
-        rejected at the gate or blocked by a pre-call guardrail before any upstream
-        call — so there is nothing to record and no phantom span.
+        A missing carrier does not mean nothing happened: a team/key-scoped logger
+        is registered as a success/failure callback only, so ``pre_call`` never
+        reaches it and the carrier never exists. The deferred span requires an
+        affirmative record of a real call: a payload plus the request-level
+        provider-handoff stamp (``upstream_started``), and no gate-rejection
+        marker. Failure events fired before any provider was attempted (router
+        pre-call rejections, SDK errors before the handoff, standalone guardrail
+        runs) lack the stamp and emit nothing.
         """
         call: Final = LLMCallEvent.from_dict(kwargs)
         call_id: Final = call.call_id
         # ``pop`` is the dedup: this method runs from both the success and failure
         # paths, and whichever fires first removes the carrier and closes the span.
         carrier: Final = self._open_llm_calls.pop(call_id, None) if call_id else None
-        if carrier is None:
+        if carrier is None and (call.is_no_upstream_call or not call.upstream_started or call.payload is None):
             return None
         payload: Final = call.payload
         if payload is None:
-            if carrier.span is not None:
+            if carrier is not None and carrier.span is not None:
                 # Opened at the boundary but the payload never materialized — end
-                # it (named provisionally) so it isn't leaked as an open span.
+                # it (named provisionally) so it isn't leaked as an open span, and
+                # register the dedup marker so a later payload-carrying close for
+                # the same call id cannot re-emit through the deferred branch.
+                self._emitter.mark_emitted(call_id, SpanRole.LLM_CALL)
                 carrier.span.end(end_time=to_ns(end_time))
             return None
         data: Final = LLMCallSpanData.from_standard_logging_payload(
@@ -452,23 +460,26 @@ class OpenTelemetryV2(CustomLogger):
             time_to_first_chunk_seconds=call.time_to_first_chunk_seconds,
         )
         end_time_ns: Final = to_ns(end_time)
-        if carrier.span is not None:
+        if carrier is not None and carrier.span is not None:
             # Born at the boundary: stamp attributes from the typed payload, set
             # status, and end it. Its parent (the server span) was captured at
-            # creation from real ambient context.
+            # creation from real ambient context. Register the dedup marker so a
+            # second close for the same call id (success then failure firing on
+            # one logging object) cannot re-emit through the deferred branch.
+            self._emitter.mark_emitted(call_id, SpanRole.LLM_CALL)
             self._emitter.finish_span(SpanRole.LLM_CALL, carrier.span, data, end_time_ns=end_time_ns)
             return carrier.span
-        # Deferred: ``pre_call`` saw no recordable parent, so create the span now.
-        # The worker copied the request task's context, which carries the anchored
-        # root span — parent to it (ambient fallback on the SDK path). Seed identity
-        # Baggage so the span — and the SDK path, which has none — is labeled
-        # consistently.
+        # Deferred: ``pre_call`` saw no recordable parent, or never reached this
+        # logger at all — create the span now. The worker copied the request
+        # task's context, which carries the anchored root span — parent to it
+        # (ambient fallback on the SDK path). Seed identity Baggage so the span —
+        # and the SDK path, which has none — is labeled consistently.
         parent_ctx = self._seed_identity_baggage(data.identity, data.request_model, resolve_request_span_context())
         return self._emitter.emit(
             SpanRole.LLM_CALL,
             data,
             parent_context=parent_ctx,
-            start_time_ns=carrier.start_time_ns,
+            start_time_ns=(carrier.start_time_ns if carrier is not None else to_ns(start_time)),
             end_time_ns=end_time_ns,
             tracer=self._tenant_tracers.tracer_for(self.tracer, call.dynamic_params),
         )
