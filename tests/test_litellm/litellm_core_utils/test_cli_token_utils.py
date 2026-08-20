@@ -400,6 +400,19 @@ class TestClearCliToken:
     def test_is_safe_when_nothing_was_ever_stored(self, isolated_home, secret_vault_factory):
         assert clear_cli_token(vault=secret_vault_factory()) == SecretErased()
 
+    @pytest.mark.parametrize("failure", [KeyringDisabled(), KeyringUnreachable()])
+    def test_a_file_that_fell_back_from_a_now_unreachable_keychain_still_warns(
+        self, isolated_home, secret_vault_factory, failure
+    ):
+        """An earlier keychain-backed login could have left an entry a subsequent fallback-to-file
+        login never cleared. When the current process cannot reach the keychain to check, a file
+        that has since regained its own secret is not evidence the keychain is clean."""
+        _write_legacy_file(isolated_home)
+        vault = secret_vault_factory(available=False, failure=failure)
+
+        assert clear_cli_token(vault=vault) == failure
+        assert not _token_file(isolated_home).exists()
+
 
 class TestIsCliTokenFresh:
     def test_a_just_issued_token_is_fresh(self):

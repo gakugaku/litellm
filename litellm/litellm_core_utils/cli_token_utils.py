@@ -105,13 +105,20 @@ def clear_cli_token(*, vault: SecretVault = SYSTEM_KEYRING) -> SecretErase:
 
 
 def _nothing_left_behind(outcome: SecretErase) -> bool:
-    """Whether the keychain can be trusted to hold no credential of ours once the file is gone"""
+    """Whether the keychain can be trusted to hold no credential of ours once the file is gone.
+
+    Only `KeyringNotInstalled` can lean on the token file: a machine with no keyring package cannot
+    have put a credential in one from this install. `KeyringDisabled` (kill switch flipped after an
+    earlier login) and `KeyringUnreachable` (backend locked or broken) both leave the door open to
+    a live entry the current process cannot see, so a file that has since fallen back to holding its
+    own secret is not proof the keychain is clean.
+    """
     match outcome:
         case SecretErased():
             return True
-        case SecretStranded():
+        case SecretStranded() | KeyringDisabled() | KeyringUnreachable():
             return False
-        case KeyringNotInstalled() | KeyringDisabled() | KeyringUnreachable():
+        case KeyringNotInstalled():
             return not _secret_lives_in_keychain()
 
 
