@@ -108,7 +108,10 @@ def save_cli_token(record: CliTokenRecord, *, vault: SecretVault = SYSTEM_KEYRIN
 
     The token file is what makes a keychain-backed credential findable again, so a file that will
     not be written takes the keychain copy down with it rather than leaving a live credential
-    stored under a machine that has no record of it.
+    stored under a machine that has no record of it. A same-server re-login is the exception: an
+    earlier successful save's file survives an atomic rewrite that never lands, and still pairs
+    with the vault slot the new secret just replaced, so the login is findable and the vault
+    entry stays.
     """
     outcome: Final = (
         SecretStored()
@@ -119,9 +122,24 @@ def save_cli_token(record: CliTokenRecord, *, vault: SecretVault = SYSTEM_KEYRIN
         _write_token_file(_without_secret(record) if isinstance(outcome, SecretStored) else record)
     except OSError as error:
         if record.key is not None and isinstance(outcome, SecretStored):
+            if _existing_file_pairs_with(record.base_url):
+                return outcome
             vault.erase()
         return CredentialNotSaved(str(error))
     return outcome
+
+
+def _existing_file_pairs_with(base_url: str) -> bool:
+    """Whether a surviving token.json still points at this same-server login.
+
+    `write_private_json` is atomic: it fails on the staged temp file, so an aborted metadata
+    rewrite leaves the previous file untouched. `_apply_vault_secret` pairs that file with the
+    vault entry we just refreshed whenever the base_url still matches, so the credential is
+    findable on the next call even though the rewrite that would have refreshed the metadata
+    did not land.
+    """
+    existing: Final = _read_token_file()
+    return existing is not None and existing.base_url == base_url
 
 
 def clear_cli_token(*, vault: SecretVault = SYSTEM_KEYRING) -> SecretErase:

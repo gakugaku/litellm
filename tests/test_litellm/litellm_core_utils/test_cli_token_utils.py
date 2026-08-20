@@ -346,6 +346,47 @@ class TestSaveCliToken:
 
         assert vault.blob is None
 
+    def test_a_same_server_relogin_keeps_the_new_secret_when_the_prior_file_still_pairs(
+        self, isolated_home, secret_vault_factory, monkeypatch
+    ):
+        """`write_private_json` fails on the staged temp file, so a prior successful save's
+        token.json survives an aborted rewrite. Its base_url still pairs with the vault slot the
+        new secret just replaced, so the login is findable and the fresh secret must not be
+        erased on top of the one it just overwrote."""
+        _write_metadata_only_file(isolated_home)
+        vault = secret_vault_factory(blob=_blob(key="sk-old"))
+
+        def _explode(*args, **kwargs):
+            raise OSError("read-only file system")
+
+        monkeypatch.setattr("litellm.litellm_core_utils.private_json.json.dump", _explode)
+
+        outcome = save_cli_token(CliTokenRecord(base_url=SERVER, key="sk-new"), vault=vault)
+
+        assert outcome == SecretStored()
+        assert json.loads(vault.blob)["key"] == "sk-new"
+        assert vault.erases == 0
+        assert load_cli_token(vault=vault).key == "sk-new"
+
+    def test_a_different_server_relogin_still_erases_when_the_prior_file_cannot_pair(
+        self, isolated_home, secret_vault_factory, monkeypatch
+    ):
+        """A prior file pointing at another server does not make the new secret findable: the
+        vault entry would be stranded under metadata that names the wrong base_url, so it has to
+        come back out."""
+        _write_metadata_only_file(isolated_home)
+        vault = secret_vault_factory(blob=_blob(key="sk-old"))
+
+        def _explode(*args, **kwargs):
+            raise OSError("read-only file system")
+
+        monkeypatch.setattr("litellm.litellm_core_utils.private_json.json.dump", _explode)
+
+        outcome = save_cli_token(CliTokenRecord(base_url=OTHER_SERVER, key="sk-new"), vault=vault)
+
+        assert isinstance(outcome, CredentialNotSaved)
+        assert vault.blob is None
+
     def test_a_failed_write_leaves_the_previous_credential_intact(self, isolated_home, secret_vault_factory, monkeypatch):
         path = _write_legacy_file(isolated_home)
         before = path.read_text()
