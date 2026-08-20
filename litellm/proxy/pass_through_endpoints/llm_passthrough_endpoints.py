@@ -2438,30 +2438,37 @@ def _build_vertex_live_setup_model_rewriter(
         aliased: Final = _resolve_alias_to_upstream_model(setup_model, llm_router)
         return (
             f"projects/{vertex_project}/locations/{vertex_location}/"
-            f"{VERTEX_PUBLISHER_MODEL_PREFIX}{aliased.removeprefix(VERTEX_PUBLISHER_MODEL_PREFIX)}"
+            f"{VERTEX_PUBLISHER_MODEL_PREFIX}{aliased}"
         )
 
     return rewrite
 
 
 def _resolve_alias_to_upstream_model(setup_model: str, llm_router: "Router | None") -> str:
-    if llm_router is None:
-        return setup_model
-    upstream: Final = next(
-        (
-            deployment["litellm_params"]["model"]
-            for deployment in (llm_router.get_model_list() or ())
-            if deployment.get("model_name") == setup_model
-        ),
-        None,
+    """
+    Return the bare Vertex model id for ``setup_model``, resolving router aliases and stripping any
+    ``publishers/google/models/``, ``models/`` (Gemini Live SDK), or ``<provider>/`` (LiteLLM id) prefix
+    so the caller can safely paste it into ``publishers/google/models/{id}``
+    """
+    upstream: Final = (
+        next(
+            (
+                deployment["litellm_params"]["model"]
+                for deployment in (llm_router.get_model_list() or ())
+                if deployment.get("model_name") == setup_model
+            ),
+            None,
+        )
+        if llm_router is not None
+        else None
     )
-    if upstream is None:
-        return setup_model
+    resolved: Final = upstream if upstream is not None else setup_model
+    without_publisher: Final = resolved.removeprefix(VERTEX_PUBLISHER_MODEL_PREFIX).removeprefix("models/")
     try:
-        _, provider, _, _ = litellm.get_llm_provider(model=upstream)
+        _, provider, _, _ = litellm.get_llm_provider(model=without_publisher)
     except litellm.exceptions.BadRequestError:
-        return upstream
-    return upstream.removeprefix(f"{provider}/")
+        return without_publisher
+    return without_publisher.removeprefix(f"{provider}/")
 
 
 async def vertex_ai_live_websocket_passthrough(
@@ -2500,9 +2507,7 @@ async def vertex_ai_live_websocket_passthrough(
         vertex_credentials_config.vertex_location if vertex_credentials_config is not None else None
     )
     credentials_value: Final = (
-        str(vertex_credentials_config.vertex_credentials)
-        if vertex_credentials_config is not None and vertex_credentials_config.vertex_credentials is not None
-        else None
+        vertex_credentials_config.vertex_credentials if vertex_credentials_config is not None else None
     )
 
     try:

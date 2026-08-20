@@ -237,6 +237,56 @@ def test_vertex_deployment_resolves_from_inline_litellm_params():
     assert resolved.vertex_credentials == '{"type": "service_account", "project_id": "proj-inline"}'
 
 
+def test_vertex_deployment_preserves_dict_credentials_from_named_credential():
+    service_account = {"type": "service_account", "project_id": "proj-db"}
+    CredentialAccessor.upsert_credentials(
+        [
+            _vertex_credential(
+                "cred_gcp_dict",
+                {
+                    "vertex_project": "proj-db",
+                    "vertex_location": "global",
+                    "vertex_credentials": service_account,
+                },
+            )
+        ]
+    )
+    llm_router = litellm.Router(
+        model_list=[
+            _vertex_deployment(
+                "gemini-live", "vertex_ai/gemini-live-2.5-flash", litellm_credential_name="cred_gcp_dict"
+            )
+        ]
+    )
+    passthrough_router = _passthrough_router(llm_router)
+
+    resolved = passthrough_router.get_vertex_credentials_from_router_deployments(model=None)
+
+    assert resolved is not None
+    assert resolved.vertex_credentials == service_account
+
+
+def test_vertex_deployment_preserves_dict_credentials_from_inline_litellm_params():
+    service_account = {"type": "service_account", "project_id": "proj-inline"}
+    llm_router = litellm.Router(
+        model_list=[
+            _vertex_deployment(
+                "gemini-live",
+                "vertex_ai/gemini-live-2.5-flash",
+                vertex_project="proj-inline",
+                vertex_location="us-east4",
+                vertex_credentials=service_account,
+            )
+        ]
+    )
+    passthrough_router = _passthrough_router(llm_router)
+
+    resolved = passthrough_router.get_vertex_credentials_from_router_deployments(model=None)
+
+    assert resolved is not None
+    assert resolved.vertex_credentials == service_account
+
+
 def _two_vertex_deployments_router() -> litellm.Router:
     return litellm.Router(
         model_list=[

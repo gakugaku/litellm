@@ -1,6 +1,8 @@
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Final
 
+from pydantic import TypeAdapter
+
 import litellm
 from litellm._logging import verbose_router_logger
 from litellm.integrations.vector_store_integrations.vector_store_pre_call_hook import (
@@ -25,6 +27,18 @@ def _get_proxy_llm_router() -> "Router | None":
 def _get_str_value(values: dict[str, object] | None, key: str) -> str | None:
     value: Final = values.get(key) if values is not None else None
     return value if isinstance(value, str) else None
+
+
+def _get_vertex_credentials_value(
+    values: dict[str, object] | None,
+) -> VERTEX_CREDENTIALS_TYPES | None:
+    """Vertex service-account credentials can be stored as a JSON string or a parsed dict; keep either shape"""
+    value: Final = values.get("vertex_credentials") if values is not None else None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return TypeAdapter(dict[str, str]).validate_python(value)
+    return None
 
 
 class PassthroughEndpointRouter:
@@ -172,9 +186,9 @@ class PassthroughEndpointRouter:
         vertex_location: Final = _get_str_value(credential_values, "vertex_location") or litellm_params.get(
             "vertex_location"
         )
-        vertex_credentials: Final = _get_str_value(credential_values, "vertex_credentials") or litellm_params.get(
-            "vertex_credentials"
-        )
+        vertex_credentials: Final = _get_vertex_credentials_value(
+            credential_values
+        ) or litellm_params.get("vertex_credentials")
         if vertex_project is None or vertex_location is None:
             return None
         return VertexPassThroughCredentials(

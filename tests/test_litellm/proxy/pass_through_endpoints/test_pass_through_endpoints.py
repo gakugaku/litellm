@@ -5161,7 +5161,12 @@ async def _run_setup_rewrite_passthrough(setup_model: str, llm_router) -> str:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "setup_model",
-    ["gemini-live-2.5-flash", "publishers/google/models/gemini-live-2.5-flash"],
+    [
+        "gemini-live-2.5-flash",
+        "publishers/google/models/gemini-live-2.5-flash",
+        "models/gemini-live-2.5-flash",
+        "vertex_ai/gemini-live-2.5-flash",
+    ],
 )
 async def test_websocket_passthrough_rewrites_setup_model_to_full_resource(setup_model):
     sent_frame = await _run_setup_rewrite_passthrough(setup_model, llm_router=None)
