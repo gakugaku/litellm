@@ -340,13 +340,24 @@ def _failure_detail(e: BaseException) -> str:
     return f"{type(e).__name__}{location}: {e}"
 
 
-def _judge_call_cost(response: object) -> float:
-    """Price a judge call, treating an unmapped judge model as free rather than fatal."""
+def _call_cost(response: object) -> float:
+    """Price one eval-arm call with the figure the spend pipeline bills: the router client
+    stamps _hidden_params.response_cost from the deployment's own pricing, which the public
+    price map lookup below cannot see (it reads 0 for deployment-priced models)."""
+    hidden: Final = getattr(response, "_hidden_params", None)
+    stamped: Final = hidden.get("response_cost") if isinstance(hidden, Mapping) else None
+    if isinstance(stamped, (int, float)):
+        return float(stamped)
+    return _price_map_cost(response)
+
+
+def _price_map_cost(response: object) -> float:
+    """Public price map fallback, treating an unmapped model as free rather than fatal."""
     import litellm
 
     try:
         return litellm.completion_cost(completion_response=response) or 0.0
-    except Exception:  # noqa: BLE001  # unmapped judge model: the verdict still counts, cost stays 0
+    except Exception:  # noqa: BLE001  # unmapped model: the attempt still counts, cost stays 0
         return 0.0
 
 
@@ -438,8 +449,8 @@ def _request_was_routed_by(request_metadata: Mapping[str, object], router_name: 
 
 @dataclass(frozen=True, slots=True)
 class _CallFailure:
-    """A shadow or judge call that produced no usable response. cost carries any judge
-    spend the failed attempt still billed, so job-level judge_spend never undercounts."""
+    """A shadow or judge call that produced no usable response. cost carries any spend
+    the failed call still billed, so job-level spend figures never undercount."""
 
     error: str
     cost: float = 0.0
@@ -452,6 +463,7 @@ class _ShadowResponse:
     text: str
     model: str
     tier: str | None
+    cost: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -478,8 +490,10 @@ class ActiveShadowEvalJob(BaseModel):
     shadow_percentage: float
     judge_model: str
     max_turns: int
+    max_budget: float | None = None
     ends_at: datetime
     attempts: int = 0
+    spend: float = 0.0
 
     @field_validator("ends_at")
     @classmethod
@@ -500,7 +514,7 @@ class ActiveShadowEvalJob(BaseModel):
         return self.baseline_model or self.router_name
 
 
-def _as_active_job(record: object, attempts: int) -> ActiveShadowEvalJob | None:
+def _as_active_job(record: object, attempts: int, spend: float) -> ActiveShadowEvalJob | None:
     """The sampling path's view of one job row, or None for a row it cannot sample: an
     unknown direction, or a reverse job with no baseline model to duplicate against.
     Failing closed here is what keeps the dispatch path total."""
@@ -509,7 +523,7 @@ def _as_active_job(record: object, attempts: int) -> ActiveShadowEvalJob | None:
     except ValidationError as e:
         verbose_logger.debug("shadow_eval: skipping unsamplable job row: %s", e)
         return None
-    return job.model_copy(update={"attempts": attempts})
+    return job.model_copy(update={"attempts": attempts, "spend": spend})  # mutable-ok: pydantic update payload
 
 
 _jobs_cache: Final = InMemoryCache(max_size_in_memory=4, default_ttl=_JOBS_CACHE_TTL_SECONDS)
@@ -531,9 +545,13 @@ class ShadowEvalLogger(CustomLogger):
         self._prisma_provider = prisma_provider or _default_prisma_provider
         self._jobs_cache = jobs_cache or _jobs_cache
         self._inflight_shadow_tasks: int = 0
-        # Starts per job since the last cache fill, never decremented within a
-        # generation; the refill absorbs written rows and resets.
+        # Starts and recorded costs per job since the last cache fill, never decremented
+        # within a generation; the refill absorbs written rows and resets. Starts hold the
+        # turn valve; costs hold the spend budget for attempts this pod has already priced
+        # (an in-flight attempt's cost is unknowable, so it can overshoot the cap by at
+        # most one generation of in-flight samples per pod).
         self._job_starts: dict[str, int] = {}  # mutable-ok: per-generation counter
+        self._job_costs: dict[str, float] = {}  # mutable-ok: per-generation counter
 
     async def _active_jobs(self) -> Mapping[str, tuple[ActiveShadowEvalJob, ...]]:
         """Active jobs by api_key_id, cache-first. A key holds at most one job per
@@ -556,18 +574,26 @@ class ShadowEvalLogger(CustomLogger):
                 await prisma.db.litellm_shadowevalattempt.group_by(
                     by=["job_id"],
                     count=True,
+                    sum={"judge_cost": True, "shadow_cost": True},  # mutable-ok: Prisma aggregate spec
                     where={"job_id": {"in": [str(record.id) for record in records]}},  # mutable-ok: Prisma filter
                 )
                 if records
                 else ()
             )
-            attempt_counts: Final = {str(row["job_id"]): int(row["_count"]["_all"]) for row in grouped or []}
+            attempt_stats: Final = {  # mutable-ok: frozen snapshot of the grouped read
+                str(row["job_id"]): (
+                    int(row["_count"]["_all"]),
+                    float((row["_sum"] or {}).get("judge_cost") or 0.0)
+                    + float((row["_sum"] or {}).get("shadow_cost") or 0.0),
+                )
+                for row in grouped or []
+            }
             by_key: Final = tuple(
                 sorted(
                     (
                         (str(record.api_key_id), job)
                         for record in records or []
-                        if (job := _as_active_job(record, attempt_counts.get(str(record.id), 0))) is not None
+                        if (job := _as_active_job(record, *attempt_stats.get(str(record.id), (0, 0.0)))) is not None
                     ),
                     key=itemgetter(0),
                 )
@@ -577,6 +603,7 @@ class ShadowEvalLogger(CustomLogger):
             )
             await self._jobs_cache.async_set_cache(_JOBS_CACHE_KEY, jobs)
             self._job_starts = {}  # rebind-ok: new generation, counts absorbed into the fill
+            self._job_costs = {}  # rebind-ok: new generation, costs absorbed into the fill  # mutable-ok: per-generation counter
             return jobs
         except Exception as e:  # noqa: BLE001  # a DB blip must never break request logging
             verbose_logger.debug("shadow_eval: active-job read failed: %s", e)
@@ -624,6 +651,7 @@ class ShadowEvalLogger(CustomLogger):
                 for job in (await self._active_jobs()).get(str(api_key_hash), ())
                 if datetime.now(timezone.utc) < job.ends_at
                 and job.attempts + self._job_starts.get(job.id, 0) < job.max_turns
+                and (job.max_budget is None or job.spend + self._job_costs.get(job.id, 0.0) < job.max_budget)
                 and _sample_hits(request_id, job.id, job.shadow_percentage)
                 and _request_was_routed_by(request_metadata, job.router_name) == (job.direction == "reverse")
             )
@@ -684,12 +712,20 @@ class ShadowEvalLogger(CustomLogger):
                 return
             if await _key_or_team_is_over_budget(parent_metadata):
                 return
-
             shadow: Final = await self._call_router_shadow(job.shadow_target, messages, shadow_params, parent_metadata)
-            if isinstance(shadow, _CallFailure):
-                await self._record_attempt(prisma, job, request_id, control_tier, outcome="error", error=shadow.error)
-                return
-
+        except Exception as e:  # noqa: BLE001  # detached task: nothing billed yet, record and never raise
+            verbose_logger.debug("shadow_eval: pipeline failed for %s: %s", request_id, e)
+            await self._record_attempt(
+                prisma, job, request_id, control_tier, outcome="error", error=f"pipeline error: {e}"
+            )
+            return
+        if isinstance(shadow, _CallFailure):
+            await self._record_attempt(
+                prisma, job, request_id, control_tier, outcome="error", error=shadow.error, shadow_cost=shadow.cost
+            )
+            return
+        # From here the shadow call has billed, so every exit records its cost.
+        try:
             verdict: Final = await self._call_judge(
                 judge_model=job.judge_model,
                 messages=messages,
@@ -707,6 +743,7 @@ class ShadowEvalLogger(CustomLogger):
                     error=verdict.error,
                     shadow=shadow,
                     judge_cost=verdict.cost,
+                    shadow_cost=shadow.cost,
                 )
                 return
             await self._record_attempt(
@@ -719,15 +756,23 @@ class ShadowEvalLogger(CustomLogger):
                 real_model=real_model,
                 confidence=verdict.confidence,
                 judge_cost=verdict.cost,
+                shadow_cost=shadow.cost,
             )
-        except Exception as e:  # noqa: BLE001  # detached task: record what happened, never raise
+        except Exception as e:  # noqa: BLE001  # detached task: the shadow call billed, record its cost, never raise
             verbose_logger.debug("shadow_eval: pipeline failed for %s: %s", request_id, e)
             await self._record_attempt(
-                prisma, job, request_id, control_tier, outcome="error", error=f"pipeline error: {e}"
+                prisma,
+                job,
+                request_id,
+                control_tier,
+                outcome="error",
+                error=f"pipeline error: {e}",
+                shadow=shadow,
+                shadow_cost=shadow.cost,
             )
 
-    @staticmethod
     async def _record_attempt(
+        self,
         prisma: "PrismaClient | None",
         job: ActiveShadowEvalJob,
         request_id: str,
@@ -738,8 +783,12 @@ class ShadowEvalLogger(CustomLogger):
         real_model: str = "",
         confidence: float | None = None,
         judge_cost: float = 0.0,
+        shadow_cost: float = 0.0,
         error: str | None = None,
     ) -> None:
+        # The money is spent whether or not the row lands, so the pod-local budget
+        # accumulator moves first.
+        self._job_costs[job.id] = self._job_costs.get(job.id, 0.0) + judge_cost + shadow_cost
         if prisma is None:
             return
         try:
@@ -753,6 +802,7 @@ class ShadowEvalLogger(CustomLogger):
                     "shadow_model": shadow.model if shadow else None,
                     "confidence": confidence,
                     "judge_cost": judge_cost,
+                    "shadow_cost": shadow_cost,
                     "error": error[:_MAX_ERROR_CHARS] if error else None,
                 }
             )
@@ -792,11 +842,12 @@ class ShadowEvalLogger(CustomLogger):
             return _CallFailure(f"shadow router call failed: {_failure_detail(e)}")
         text: Final = _chat_final_text(response)
         if not text:
-            return _CallFailure("shadow router returned an empty response")
+            return _CallFailure("shadow router returned an empty response", cost=_call_cost(response))
         return _ShadowResponse(
             text=text,
             model=str(getattr(response, "model", None) or _routing_decision(shadow_metadata).get("routed_model") or ""),
             tier=_routed_tier(shadow_metadata),
+            cost=_call_cost(response),
         )
 
     async def _call_judge(
@@ -843,11 +894,11 @@ class ShadowEvalLogger(CustomLogger):
             verdict: Final = PairwiseVerdict.model_validate(parse_json_verdict(raw))
         except Exception as e:  # noqa: BLE001  # malformed verdicts become error rows
             verbose_logger.debug("shadow_eval: unparseable judge verdict: %s", e)
-            return _CallFailure(f"unparseable judge verdict: {e}", cost=_judge_call_cost(response))
+            return _CallFailure(f"unparseable judge verdict: {e}", cost=_call_cost(response))
         return _JudgeVerdict(
             preference=_unmask_preference(verdict.preference, real_is_a),
             confidence=max(0.0, min(1.0, verdict.confidence)),
-            cost=_judge_call_cost(response),
+            cost=_call_cost(response),
         )
 
 

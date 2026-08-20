@@ -80,7 +80,9 @@ const job = (overrides: Partial<ShadowEvalJob> = {}): ShadowEvalJob => ({
   keys: [
     {
       api_key_id: "hashed-key-abc",
-      max_turns: 200,
+      max_turns: 10000,
+      max_budget: 10,
+      spend: 3.21,
       stopped_at: null,
       key_alias: "prod-alpha",
       key_name: "sk-...alpha",
@@ -133,7 +135,9 @@ const keyEntry = (
   overrides: Partial<ShadowEvalJob["keys"][number]> = {},
 ): ShadowEvalJob["keys"][number] => ({
   api_key_id,
-  max_turns: 200,
+  max_turns: 10000,
+  max_budget: 10,
+  spend: 0,
   stopped_at: null,
   key_alias: null,
   key_name: null,
@@ -320,6 +324,21 @@ describe("ShadowEvalSection", () => {
     expect(screen.getByText(/ends in 3 days/)).toBeInTheDocument();
   });
 
+  it("shows recorded eval spend against the job's dollar budget", () => {
+    const j = job();
+    mockHooks({ jobs: [j], detailsById: { "job-1": j } });
+    render(<ShadowEvalSection />);
+    expect(screen.getByText(/\$3\.21 of \$10\.00 eval spend/)).toBeInTheDocument();
+  });
+
+  it("shows spend without a budget cap for a job from before spend budgets existed", () => {
+    const j = job({ keys: [keyEntry("hashed-key-abc", { max_budget: null, spend: 3.21 })] });
+    mockHooks({ jobs: [j], detailsById: { "job-1": j } });
+    render(<ShadowEvalSection />);
+    expect(screen.getByText(/\$3\.21 eval spend/)).toBeInTheDocument();
+    expect(screen.queryByText(/of \$/)).not.toBeInTheDocument();
+  });
+
   it("flags rows with fewer than 30 judged turns as low sample", () => {
     const j = job();
     mockHooks({ jobs: [j], detailsById: { "job-1": j } });
@@ -383,7 +402,7 @@ describe("ShadowEvalSection", () => {
       direction: "forward",
       shadow_percentage: 10,
       duration_days: 7,
-      max_turns: 200,
+      max_budget: 10,
       judge_model: "anthropic/claude-sonnet-5",
     };
     expect(start.mutate).toHaveBeenCalledWith(expectedBody);
@@ -419,7 +438,7 @@ describe("ShadowEvalSection", () => {
       baseline_model: "prod-claude",
       shadow_percentage: 10,
       duration_days: 7,
-      max_turns: 200,
+      max_budget: 10,
       judge_model: "anthropic/claude-sonnet-5",
     };
     expect(start.mutate).toHaveBeenCalledWith(expectedBody);
