@@ -402,14 +402,16 @@ class TestKeyringVault:
 
     def test_an_uninstalled_keyring_library_degrades_to_the_file(self, monkeypatch):
         """keyring is an optional extra, so the SDK must survive its absence rather than raise on
-        the hot path."""
+        the hot path. Erase still fails: a credential stored from another environment (e.g. an
+        install with the `cli` extra) may be in the keychain, and without keyring `lite logout`
+        cannot verify it is gone, so it must warn instead."""
         monkeypatch.delenv(DISABLE_KEYRING_ENV_VAR, raising=False)
         monkeypatch.setitem(sys.modules, "keyring", None)
         vault = KeyringVault()
 
         assert vault.read() == KeyringNotInstalled()
         assert vault.write("blob-1") == KeyringNotInstalled()
-        assert vault.erase() is True
+        assert vault.erase() is False
 
     def test_a_locked_keychain_is_reported_not_raised(self, install_fake_keyring):
         install_fake_keyring(_FakeKeyringModule(get_error=RuntimeError("keyring is locked")))
